@@ -1,9 +1,0 @@
-# Nothing here is ever a build context today, but if a Dockerfile is added the
-# model weights must not be shipped into it.
-ollama/
-out/
-.git/
-.idea/
-*.md
-.env
-.env.*

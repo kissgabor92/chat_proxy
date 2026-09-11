@@ -1,110 +1,111 @@
-# proxy_stack — an isolated OpenAI endpoint for VS Code
+# proxy_stack — an OpenAI-compatible endpoint for any Open WebUI
 
-A ~300-line standard-library Python service that exposes the local model to VS Code as an
-OpenAI-compatible API, by talking to Open WebUI.
+A ~300-line standard-library Python service. Point it at an Open WebUI instance and it
+exposes that instance's models as an OpenAI-compatible API, so clients like VS Code can
+use it.
 
-Verified end to end on this host on 2026-09-11.
+Standalone: one container, no dependencies, and one thing to configure.
 
 ```
 proxy_stack/
 ├── init.sh          start here
-├── proxy.py         the whole service, stdlib only, no dependencies
+├── proxy.py         the whole service, stdlib only
 ├── Dockerfile       python:3.13-alpine pinned by digest
-├── compose.yaml     joins the existing chat-proxy network
-├── test.sh          33 checks, the definition of done
-├── .env             WEBUI_TOKEN (git-ignored)
+├── compose.yaml     one service, host networking
+├── test.sh          26 checks, the definition of done
+├── .env             LLM_HOSTNAME + WEBUI_TOKEN (git-ignored)
 └── .env.example
 ```
 
-## Two ports, two services
+## Configure
 
-**This port serves no interface.** The Open WebUI UI is on its own port, so which port you
-are talking to always tells you which service answered.
-
-```
-browser ──▶ 127.0.0.1:3000   Open WebUI (the interface)
-                    │
-VS Code ──▶ 127.0.0.1:8111   this service ──▶ webui:8080 ──▶ ollama:11434
-                    (OpenAI API only)                        (behind Open WebUI)
-```
-
-| Port | Service | Serves |
-| --- | --- | --- |
-| `3000` | `chat-proxy-webui` | The Open WebUI interface. Open it in a browser |
-| `8111` | `chat-proxy-vscode` | `GET /v1/models`, `POST /v1/chat/completions`, `GET /health`. **Everything else is 404** |
-
-Ollama publishes nothing and is never addressed by this service — every model request goes
-through Open WebUI, so its model access rules always apply. `test.sh` asserts `proxy.py`
-contains no route to Ollama, and that `/` on 8111 returns 404 rather than the UI.
-
-| This service | Open WebUI endpoint it calls |
-| --- | --- |
-| `GET /v1/models` | `GET /api/models` |
-| `POST /v1/chat/completions` | `POST /api/chat/completions` |
-
-## Run it
-
-Both scripts resolve their own directory, so run them by path from anywhere — these work
-from the repository root:
-
-```bash
-./llm_stack/init.sh      # Ollama + Open WebUI  (UI on :3000)
-./proxy_stack/init.sh    # this service          (API on :8111)
-./proxy_stack/test.sh    # 33 checks
-```
-
-Order matters: `proxy_stack` joins a network that `llm_stack` creates, and refuses to start
-with a clear message if it is missing.
-
-| | |
-| --- | --- |
-| `./proxy_stack/init.sh` | Build, up, verify |
-| `./proxy_stack/init.sh --no-build` | Skip the image build |
-| `./proxy_stack/init.sh --down` | Stop |
-
-## Authentication
-
-The bridge has no credential of its own. A request travels upstream on **the caller's own
-Open WebUI token**, so Open WebUI decides what that user may do. Both credential shapes it
-issues work, and the bridge never has to tell them apart:
-
-| Credential | Where it comes from |
-| --- | --- |
-| API key (`sk-...`) | The UI: **Settings → Account → API Keys → Create** |
-| Session JWT | The `token` field of `GET /api/v1/auths/`, which returns `token_type: "Bearer"` |
-
-### The pinned token
-
-VS Code has no browser session, so put a token in `.env`:
+One required setting:
 
 ```bash
 # proxy_stack/.env
-WEBUI_TOKEN=sk-...
+LLM_HOSTNAME=http://127.0.0.1:3000
 ```
 
-That token is used upstream whenever a caller supplies none — the "provide it beforehand"
-case, which lets VS Code be configured with any placeholder key. A caller's own token
+`LLM_HOSTNAME` is the Open WebUI this proxy sits in front of. It accepts a bare host, a
+host:port, or a full URL with a base path — all of these work:
+
+| Value | Resolves to |
+| --- | --- |
+| `webui.example.com` | `http://webui.example.com:80` |
+| `webui.example.com:3000` | `http://webui.example.com:3000` |
+| `http://127.0.0.1:3000` | `http://127.0.0.1:3000` |
+| `https://ai.example.com/openwebui/` | `https://ai.example.com:443/openwebui` |
+
+A value that is not a usable host, or a scheme other than http/https, is refused at startup
+with a message saying which — not a DNS error thirty seconds later.
+
+## Run it
+
+```bash
+./init.sh            # build, up, verify
+./init.sh --no-build # skip the image build
+./init.sh --down     # stop
+./test.sh            # 26 checks
+```
+
+`init.sh` resolves `LLM_HOSTNAME` the same way `proxy.py` does, checks the upstream is
+reachable, checks the port is free, waits for health, then confirms the proxy serves the
+API and lists the models it can see. Safe to re-run, and callable from any directory.
+
+### Why host networking
+
+The container runs with `network_mode: host`. An Open WebUI published on the host's
+loopback — `127.0.0.1:3000`, the common case — is unreachable from a bridged container:
+`host.docker.internal` resolves to the bridge gateway and times out against a
+loopback-bound port. Measured on this host, both ways.
+
+Host networking also means `ports:` does not apply; the proxy binds `LISTEN_HOST` itself,
+which defaults to `127.0.0.1`. Set it to `0.0.0.0` to expose the endpoint on the network —
+which also exposes whatever the pinned token can reach.
+
+## What it serves
+
+```
+client ──▶ 127.0.0.1:8111 ──▶ <LLM_HOSTNAME> (Open WebUI) ──▶ its own models
+```
+
+| Route | Upstream |
+| --- | --- |
+| `GET /v1/models` | `GET <base>/api/models` |
+| `POST /v1/chat/completions` | `POST <base>/api/chat/completions` |
+| `GET /health` | answered locally, no credential |
+
+**Everything else is 404.** This serves no interface — Open WebUI has its own, and sharing
+one port between them makes it impossible to tell which service answered. `test.sh` asserts
+`/` returns 404 rather than HTML.
+
+## Authentication
+
+The proxy has no credential of its own. A request travels upstream on **the caller's own
+Open WebUI token**, so Open WebUI decides what that user may do. Both shapes it issues work:
+
+| Credential | Where it comes from |
+| --- | --- |
+| API key (`sk-...`) | Settings → Account → API Keys → Create |
+| Session JWT | Your browser: F12 → Console → `localStorage.token` |
+
+Set `WEBUI_TOKEN` in `.env` and it is used when a caller sends none — so a client that
+cannot hold a credential (VS Code with a placeholder key) still works. A caller's own token
 always wins.
 
-> **A pinned token means an unauthenticated caller is served.** Anything that can reach
-> port 8111 can then use the model. The port is loopback-only, but if that is not the trade
-> you want, set `REQUIRE_CLIENT_TOKEN=true` — the pinned token then acts purely as the
-> upstream credential and a caller must still present its own. `/health` reports which mode
-> is active, and so does `init.sh`.
+> **A pinned token means an unauthenticated caller is served.** Anything that can reach the
+> port can use the model. It binds loopback by default, but if that is not the trade you
+> want, set `REQUIRE_CLIENT_TOKEN=true` — the pinned token then acts purely as the upstream
+> credential. `/health` reports which mode is active, and so does `init.sh`.
 
-Get one from the UI on <http://127.0.0.1:3000> — **Settings → Account → API Keys → Create**.
-
-> Open WebUI stores **one API key per user**. Creating a new one in the UI retires the
+> Open WebUI stores **one API key per user**: creating a new one in the UI retires the
 > previous one, so a key pinned in `.env` stops working the moment you press Create again.
 > `test.sh` deliberately never mints a key for this reason.
 
-> **Prefer an `sk-` key over a session JWT.** A JWT is signed with Open WebUI's
-> `WEBUI_SECRET_KEY`; an `sk-` key lives in the database and survives a key rotation.
-
 ## What it translates, and why
 
-Open WebUI's responses deviate from the OpenAI schema in ways that matter to a client.
-Each of these was measured against this stack, not assumed.
+Open WebUI's responses deviate from the OpenAI schema in ways that matter to a client. Each
+was measured, not assumed.
 
 | Deviation | Fix |
 | --- | --- |
@@ -114,13 +115,16 @@ Each of these was measured against this stack, not assumed.
 | Streaming deltas carry `reasoning_content`, sometimes with no content at all | Accumulated, not forwarded; flushed as one content chunk only if the stream produced no content. Deltas emptied by stripping are dropped rather than sent as empty tokens |
 
 Everything else — `tools`, `tool_calls`, `usage`, model ids, the request body itself — is
-forwarded byte for byte. The body is parsed only to learn whether the caller asked for a
+forwarded unchanged. The body is parsed only to learn whether the caller asked for a
 stream, so nothing the client sent is silently rewritten.
 
 ## Using it from VS Code
 
-VS Code 1.137.0 bundles `copilot-chat` 0.65.0. Use the **Custom Endpoint** provider via the
-model picker → *Manage Models*. Paste the token from `.env` as the API key, then:
+VS Code 1.137 bundles `copilot-chat`. Model picker → *Manage Models* → **Custom Endpoint**
+(not "Ollama" or "OpenAI Compatible" — both are deprecated, and the latter is hidden on
+stable builds). Paste a token as the API key, then add the model.
+
+The config lands in `~/.config/Code/User/chatLanguageModels.json`:
 
 ```json
 {
@@ -135,27 +139,18 @@ model picker → *Manage Models*. Paste the token from `.env` as the API key, th
 }
 ```
 
-`id` must match what `/v1/models` returns exactly, colon included — VS Code sends back
-whatever id it was given. `contextWindow` must not exceed `OLLAMA_CONTEXT_LENGTH` in
-`llm_stack/compose.yaml` (currently 16384); claiming more does not raise the limit, it just
-makes VS Code send prompts that are silently truncated.
-
-## Tests
-
-`./test.sh` is the definition of done — 33 checks covering authentication, the OpenAI
-translation, tool-call correction, streaming, the isolation of this port from the UI, and
-the host port map. There was no test command anywhere in this repository
-before this directory; it brings its own.
-
-```
-passed 33, failed 0
-```
+- **`id` is sent as the model name and must match `/v1/models` exactly**, colon included.
+  `name` is only a display label. Swapping them yields `400 {"detail":"Model not found"}`.
+- `contextWindow` must not exceed what the upstream model actually serves; claiming more
+  does not raise the limit, it makes prompts silently truncate.
+- VS Code reads this file **at window startup**. After editing it, reload the window — and
+  re-pick the model, since the remembered selection is stored by id.
 
 ## Troubleshooting
 
-- **`webui` does not resolve** — this service joined a different network. `docker network inspect chat-proxy --format '{{range .Containers}}{{.Name}} {{end}}'` must list `chat-proxy-vscode` alongside `chat-proxy-webui`. The network is declared `external: true` precisely to prevent this.
-- **401 from VS Code** — the token was revoked in the UI, or `.env` was edited without recreating the container. Editing `.env` alone does not reach a running container; re-run `./init.sh --no-build`.
-- **`/v1/models` is empty** — the token is valid but Open WebUI is exposing no models to that user. Check the model list in the UI first.
-- **A tool is never called** — confirm `finish_reason` comes back as `tool_calls`; `./test.sh` has a check for exactly this.
-- **A browser on 8111 shows `{"detail": "no such route: /"}`** — that is correct. The interface is on <http://127.0.0.1:3000>; 8111 is the API only.
-- **Tokens all stopped working after a restart** — `WEBUI_SECRET_KEY` must be pinned in `llm_stack/.env`, or Open WebUI regenerates it on every container recreation and invalidates every JWT and browser session.
+- **Every request 502s** — the upstream is unreachable. `curl $LLM_HOSTNAME/api/config` from this host; `init.sh` checks this before starting.
+- **401** — the token was revoked, or `.env` was edited without recreating the container. Editing `.env` alone does not reach a running container; re-run `./init.sh --no-build`.
+- **`/v1/models` is empty** — the token is valid but Open WebUI exposes no models to that user. Check the model list in the UI first.
+- **A tool is never called** — confirm `finish_reason` comes back as `tool_calls`; `test.sh` checks exactly this.
+- **A browser on this port shows `{"detail": "no such route: /"}`** — correct. The interface is at `LLM_HOSTNAME`; this port is the API only.
+- **Every token stopped working after an Open WebUI restart** — that instance is regenerating `WEBUI_SECRET_KEY` on each container recreation, which invalidates every JWT and browser session. Pin it in the Open WebUI deployment.

@@ -1,50 +1,42 @@
-name: chat-proxy-vscode
+name: llm-proxy
 
 services:
   proxy:
     build: .
-    image: chat-proxy-vscode:1.0
-    container_name: chat-proxy-vscode
+    image: llm-proxy:1.0
+    container_name: llm-proxy
     restart: unless-stopped
 
-    environment:
-      # Open WebUI is the only upstream. Ollama sits behind it and is never
-      # addressed from here, so Open WebUI's model permissions always apply.
-      WEBUI_HOST: webui
-      WEBUI_PORT: "8080"
-      LISTEN_PORT: "8111"
-      # The token requests travel upstream with when the caller supplies none.
-      # Copy it from the `token` field of GET /api/v1/auths/, or from the
-      # account page's API Keys section. Supplied from .env, which the
-      # repo-root .gitignore already covers.
-      WEBUI_TOKEN: ${WEBUI_TOKEN:-}
-      # true = a caller must present its own bearer token even when WEBUI_TOKEN
-      # is pinned. false = an unauthenticated caller is served using the pinned
-      # token, which is what lets VS Code be configured with a placeholder key.
-      REQUIRE_CLIENT_TOKEN: ${REQUIRE_CLIENT_TOKEN:-false}
+    # Host networking, so LLM_HOSTNAME can name an Open WebUI published on the
+    # host's loopback. A bridged container cannot reach 127.0.0.1:3000 --
+    # host.docker.internal resolves to the bridge gateway and times out against
+    # a loopback-bound port. With host networking the proxy binds LISTEN_HOST
+    # itself, so `ports:` does not apply.
+    network_mode: host
 
-    # Loopback only, like every other container on this host. This is the
-    # single front door: the browser UI and the VS Code endpoint both arrive
-    # here, and neither webui:8080 nor ollama:11434 is published.
-    ports:
-      - "127.0.0.1:8111:8111"
+    environment:
+      # The only thing this service needs to know. Accepts a bare host, a
+      # host:port, or a full URL with a base path:
+      #   webui.example.com | webui.example.com:3000
+      #   http://127.0.0.1:3000 | https://ai.example.com/openwebui/
+      LLM_HOSTNAME: ${LLM_HOSTNAME:?set LLM_HOSTNAME in .env}
+
+      # Loopback only. Set 0.0.0.0 to expose the endpoint on the network, which
+      # also exposes whatever the pinned token can reach.
+      LISTEN_HOST: ${LISTEN_HOST:-127.0.0.1}
+      LISTEN_PORT: ${LISTEN_PORT:-8111}
+
+      # An Open WebUI token used when the caller sends none.
+      WEBUI_TOKEN: ${WEBUI_TOKEN:-}
+
+      # true = a caller must present its own bearer token even when WEBUI_TOKEN
+      # is set; the pinned token is then only the upstream credential.
+      REQUIRE_CLIENT_TOKEN: ${REQUIRE_CLIENT_TOKEN:-false}
 
     healthcheck:
       test: ["CMD", "python", "-c",
-             "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8111/health',timeout=3)"]
+             "import os,urllib.request;urllib.request.urlopen('http://127.0.0.1:%s/health' % os.environ.get('LISTEN_PORT','8111'),timeout=3)"]
       interval: 10s
       timeout: 5s
       retries: 6
       start_period: 5s
-
-    networks:
-      - chat-proxy
-
-networks:
-  # External on purpose. llm_stack/compose.yaml sets project name `chat-proxy`
-  # and owns this network; declaring it normally from a different project name
-  # would make Docker create `chat-proxy-vscode_chat-proxy` instead, and the
-  # hostname `ollama` would stop resolving.
-  chat-proxy:
-    external: true
-    name: chat-proxy

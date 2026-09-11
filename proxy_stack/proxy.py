@@ -1,18 +1,21 @@
 """
-An isolated OpenAI-compatible endpoint for VS Code, in front of Open WebUI.
+A standalone OpenAI-compatible endpoint in front of an Open WebUI instance.
 
-This serves one thing and nothing else:
+Point it at any Open WebUI with LLM_HOSTNAME and it serves three routes:
 
-  GET  /v1/models            -> Open WebUI GET  /api/models
-  POST /v1/chat/completions  -> Open WebUI POST /api/chat/completions
+  GET  /v1/models            -> <LLM_HOSTNAME>/api/models
+  POST /v1/chat/completions  -> <LLM_HOSTNAME>/api/chat/completions
   GET  /health               -> liveness, no credential
 
-Any other path is 404. The browser UI is Open WebUI's own port, not this one --
-mixing the two behind a single port made it impossible to tell which service was
-answering.
+Any other path is 404. This serves no interface -- Open WebUI has its own.
 
-Ollama sits behind Open WebUI and is never addressed here, so Open WebUI's model
-permissions always apply and this process cannot become a way around them.
+LLM_HOSTNAME accepts whatever you have: a bare host, a host:port, or a full URL
+with a base path. All of these resolve to the same upstream:
+
+    webui.example.com
+    webui.example.com:3000
+    http://127.0.0.1:3000
+    https://ai.example.com/openwebui/
 
 Standard library only. It exists to translate, not to decide:
 
@@ -32,24 +35,60 @@ import sys
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-LISTEN_HOST = os.environ.get("LISTEN_HOST", "0.0.0.0")
+LISTEN_HOST = os.environ.get("LISTEN_HOST", "127.0.0.1")
 LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "8111"))
-WEBUI_HOST = os.environ.get("WEBUI_HOST", "webui")
-WEBUI_PORT = int(os.environ.get("WEBUI_PORT", "8080"))
+
 # Inference can take minutes on a cold model load; a short timeout here shows up
 # as a truncated reply in the editor rather than as an error.
 UPSTREAM_TIMEOUT = int(os.environ.get("UPSTREAM_TIMEOUT", "600"))
 
 # The Open WebUI token requests travel upstream with when the caller supplies
-# none -- the "provide it beforehand" case, so VS Code can be configured with
-# any placeholder key. A caller's own token always wins, so per-user model
-# permissions still apply.
+# none, so a client that cannot hold a credential still works. A caller's own
+# token always wins, so per-user model permissions still apply.
 WEBUI_TOKEN = os.environ.get("WEBUI_TOKEN", "").strip()
 
 # With a pinned token, a request carrying no credential is answered using it.
 # Convenient, but it means anything that can reach this port can use the model.
 # Set true to demand a bearer token anyway.
 REQUIRE_CLIENT_TOKEN = os.environ.get("REQUIRE_CLIENT_TOKEN", "false").lower() == "true"
+
+
+def parse_upstream(value):
+    """Turn LLM_HOSTNAME into (use_tls, host, port, base_path).
+
+    Accepts a bare host, a host:port, or a full URL with a base path, because
+    "the hostname of my Open WebUI" means all three to different people and
+    guessing wrong fails with a DNS error that explains nothing.
+    """
+    value = (value or "").strip()
+    if not value:
+        raise SystemExit(
+            "LLM_HOSTNAME is not set -- point it at an Open WebUI instance, "
+            "e.g. http://127.0.0.1:3000 or webui.example.com"
+        )
+    # urlsplit only finds a host when a scheme is present; add the default first.
+    if "://" not in value:
+        value = "http://" + value
+    parts = urllib.parse.urlsplit(value)
+    if parts.scheme not in ("http", "https"):
+        raise SystemExit("LLM_HOSTNAME scheme must be http or https, got %r" % parts.scheme)
+    if not parts.hostname:
+        raise SystemExit("LLM_HOSTNAME has no host: %r" % value)
+    tls = parts.scheme == "https"
+    port = parts.port or (443 if tls else 80)
+    # A base path lets Open WebUI live behind a reverse proxy on a subpath.
+    base = parts.path.rstrip("/")
+    return tls, parts.hostname, port, base
+
+
+USE_TLS, UPSTREAM_HOST, UPSTREAM_PORT, UPSTREAM_BASE = parse_upstream(
+    os.environ.get("LLM_HOSTNAME", "")
+)
+
+
+def upstream_label():
+    scheme = "https" if USE_TLS else "http"
+    return "%s://%s:%d%s" % (scheme, UPSTREAM_HOST, UPSTREAM_PORT, UPSTREAM_BASE)
 
 
 def log(*parts):
@@ -114,8 +153,9 @@ class Handler(BaseHTTPRequestHandler):
         headers = {"Content-Type": "application/json"}
         if token:
             headers["Authorization"] = "Bearer " + token
-        conn = http.client.HTTPConnection(WEBUI_HOST, WEBUI_PORT, timeout=UPSTREAM_TIMEOUT)
-        conn.request(method, path, body=body, headers=headers)
+        cls = http.client.HTTPSConnection if USE_TLS else http.client.HTTPConnection
+        conn = cls(UPSTREAM_HOST, UPSTREAM_PORT, timeout=UPSTREAM_TIMEOUT)
+        conn.request(method, UPSTREAM_BASE + path, body=body, headers=headers)
         return conn.getresponse()
 
     # ---------- routing ----------
@@ -126,7 +166,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/health":
             return self.send_json(200, {
                 "status": "ok",
-                "webui": "%s:%d" % (WEBUI_HOST, WEBUI_PORT),
+                "upstream": upstream_label(),
                 "pinned_token_configured": bool(WEBUI_TOKEN),
                 "client_token_required": REQUIRE_CLIENT_TOKEN,
             })
@@ -168,7 +208,7 @@ class Handler(BaseHTTPRequestHandler):
             resp = self.webui("GET", "/api/models")
             raw = resp.read()
         except OSError as exc:
-            return self.send_detail(502, "Open WebUI unreachable: %s" % exc)
+            return self.send_detail(502, "Open WebUI unreachable at %s: %s" % (upstream_label(), exc))
         if resp.status != 200:
             return self.send_detail(resp.status, raw.decode(errors="replace")[:500])
 
@@ -200,7 +240,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             resp = self.webui("POST", "/api/chat/completions", body=raw)
         except OSError as exc:
-            return self.send_detail(502, "Open WebUI unreachable: %s" % exc)
+            return self.send_detail(502, "Open WebUI unreachable at %s: %s" % (upstream_label(), exc))
 
         if resp.status >= 400:
             return self.send_detail(resp.status, resp.read().decode(errors="replace")[:500])
@@ -293,8 +333,8 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     server = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
     server.daemon_threads = True
-    log("openai endpoint on %s:%d -> open webui %s:%d (pinned token: %s)"
-        % (LISTEN_HOST, LISTEN_PORT, WEBUI_HOST, WEBUI_PORT, "yes" if WEBUI_TOKEN else "no"))
+    log("openai endpoint on %s:%d -> %s (pinned token: %s)"
+        % (LISTEN_HOST, LISTEN_PORT, upstream_label(), "yes" if WEBUI_TOKEN else "no"))
     server.serve_forever()
 
 

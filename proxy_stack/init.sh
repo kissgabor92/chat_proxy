@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Bring up the isolated OpenAI endpoint that VS Code talks to.
+# Bring up the OpenAI-compatible proxy in front of an Open WebUI instance.
 #
 # Safe to re-run: it never overwrites an existing .env and never recreates a
 # container that is already healthy.
@@ -14,19 +14,14 @@ set -euo pipefail
 HERE="$(dirname "$(readlink -f "$0")")"
 cd "$HERE"
 
-PORT=8111
-UI_PORT=3000
-NETWORK=chat-proxy
 BUILD=1
-
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --no-build)  BUILD=0 ;;
-    --down)      exec docker compose down ;;
-    -h|--help)   sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-    *) echo "unknown argument: $1 (try --help)" >&2; exit 2 ;;
+for arg in "$@"; do
+  case "$arg" in
+    --no-build) BUILD=0 ;;
+    --down)     exec docker compose down ;;
+    -h|--help)  sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "unknown argument: $arg (try --help)" >&2; exit 2 ;;
   esac
-  shift
 done
 
 say()  { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
@@ -41,62 +36,69 @@ docker compose version >/dev/null 2>&1 || die "the docker compose v2 plugin is m
 docker info >/dev/null 2>&1 || die "the docker daemon is not reachable"
 ok "docker $(docker --version | awk '{print $3}' | tr -d ,), compose $(docker compose version --short)"
 
-# The network is declared external: it belongs to the llm_stack project. Without
-# it `up` fails with a bare "network not found", which does not say what to do.
-if ! docker network inspect "$NETWORK" >/dev/null 2>&1; then
-  die "network '$NETWORK' does not exist — start the model stack first: (cd ../llm_stack && ./init.sh)"
-fi
-ok "network '$NETWORK' exists"
-
-# This service resolves webui by name over that network. If they are absent it
-# still starts happily and every request 502s instead, so say so up front.
-members="$(docker network inspect "$NETWORK" --format '{{range .Containers}}{{.Name}} {{end}}')"
-missing=""
-for c in chat-proxy-ollama chat-proxy-webui; do
-  grep -q "$c" <<<"$members" || missing="$missing $c"
-done
-if [ -n "$missing" ]; then
-  warn "not on '$NETWORK':$missing — every request will 502"
-  warn "start the model stack with: (cd ../llm_stack && ./init.sh)"
-else
-  ok "upstreams present: chat-proxy-ollama, chat-proxy-webui"
-fi
-
-# There is no credential to generate: authentication is an Open WebUI token, and
-# Open WebUI issues it. An empty WEBUI_TOKEN is valid -- it just means every
-# caller must present a live session token instead of a pinned one.
+# There is nothing to generate: this proxy has no credential of its own, and
+# LLM_HOSTNAME is the one thing only the operator knows.
 if [ ! -f .env ]; then
-  { echo "# An Open WebUI token. Get one from Settings -> Account -> API Keys,"
-    echo "# or the \`token\` field of GET /api/v1/auths/."
-    echo "WEBUI_TOKEN="; } > .env
+  cp .env.example .env
   chmod 600 .env
-  warn "created .env with an empty WEBUI_TOKEN — set one for VS Code (see below)"
-elif grep -q '^WEBUI_TOKEN=.\+' .env; then
-  ok ".env present with a pinned Open WebUI token"
+  die "created .env from the example — set LLM_HOSTNAME in it, then re-run"
+fi
+ok ".env present"
+
+LLM_HOSTNAME="$(grep -E '^LLM_HOSTNAME=' .env | cut -d= -f2- | tr -d '"' | tr -d "'")"
+[ -n "$LLM_HOSTNAME" ] || die "LLM_HOSTNAME is empty in .env — point it at an Open WebUI instance"
+PORT="$(grep -E '^LISTEN_PORT=' .env | cut -d= -f2-)"; PORT="${PORT:-8111}"
+
+# Resolve exactly the way proxy.py does, so a bad value is caught here with an
+# explanation rather than as a crash loop after `up`.
+read -r SCHEME HOST UPORT BASE <<EOF
+$(python3 - "$LLM_HOSTNAME" <<'PY'
+import sys, urllib.parse
+v = sys.argv[1].strip()
+if "://" not in v:
+    v = "http://" + v
+p = urllib.parse.urlsplit(v)
+if p.scheme not in ("http", "https") or not p.hostname:
+    sys.exit(1)
+print(p.scheme, p.hostname, p.port or (443 if p.scheme == "https" else 80), p.path.rstrip("/") or "-")
+PY
+)
+EOF
+[ -n "${HOST:-}" ] || die "LLM_HOSTNAME is not a usable host or URL: $LLM_HOSTNAME"
+[ "$BASE" = "-" ] && BASE=""
+ok "upstream: ${SCHEME}://${HOST}:${UPORT}${BASE}"
+
+# An unreachable upstream makes every request 502; say so before starting.
+if python3 -c "
+import socket,sys
+try:
+    socket.create_connection(('$HOST', $UPORT), timeout=5).close()
+except OSError as e:
+    sys.exit(str(e))
+" 2>/dev/null; then
+  ok "upstream reachable"
 else
-  warn "WEBUI_TOKEN is empty in .env — clients must send a live session token"
+  warn "cannot reach ${HOST}:${UPORT} from this shell — every request will 502"
+  warn "note the container uses host networking, so it resolves names the same way"
 fi
 
 # Only a conflict we did not create ourselves matters.
-if ss -ltn 2>/dev/null | grep -q "127.0.0.1:${PORT} " \
+if ss -ltn 2>/dev/null | grep -qE "127\.0\.0\.1:${PORT} |0\.0\.0\.0:${PORT} " \
 && ! docker compose ps --status running --services 2>/dev/null | grep -q proxy; then
-  die "port ${PORT} is already in use by something else — change the ports: mapping"
+  die "port ${PORT} is already in use by something else — change LISTEN_PORT in .env"
 fi
 ok "port ${PORT} available"
 
-say "Starting the OpenAI endpoint"
-if [ "$BUILD" = "1" ]; then
-  docker compose up -d --build --wait
-else
-  docker compose up -d --wait
-fi
+say "Starting the proxy"
+if [ "$BUILD" = "1" ]; then docker compose up -d --build --wait; else docker compose up -d --wait; fi
 docker compose ps --format '    {{.Name}}  {{.Status}}'
 
 say "Verifying"
 
 health="$(curl -s -m 5 "http://127.0.0.1:${PORT}/health" || true)"
-if echo "$health" | grep -q '"status": *"ok"'; then
-  mode="$(echo "$health" | python3 -c '
+echo "$health" | grep -q '"status": *"ok"' \
+  || die "proxy did not answer /health — see: docker compose logs proxy"
+mode="$(echo "$health" | python3 -c '
 import sys, json
 d = json.load(sys.stdin)
 if d["client_token_required"]:
@@ -104,47 +106,32 @@ if d["client_token_required"]:
 elif d["pinned_token_configured"]:
     print("anonymous callers served on the pinned token")
 else:
-    print("callers must send their own token (none pinned)")' 2>/dev/null || echo 'unknown auth mode')"
-  ok "endpoint healthy — $mode"
-else
-  die "endpoint did not answer /health — see: docker compose logs proxy"
-fi
+    print("callers must send their own token (none pinned)")' 2>/dev/null || echo "unknown auth mode")"
+ok "proxy healthy — $mode"
 
-# This port must NOT serve the interface. A 200 here would mean it is
-# proxying Open WebUI again, and the port would stop telling you which
-# service answered.
+# This port must serve no interface. A 200 here would mean it is proxying the
+# UI again, and the port would stop telling you which service answered.
 code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${PORT}/" || true)"
 [ "$code" = "404" ] && ok "serves the API only — / is 404, not the UI" \
                     || warn "/ returned HTTP ${code:-no response}, expected 404"
 
-# A 200 on the UI only proves the pass-through works. The model list travels a
-# different path -- through Open WebUI's /api/models -- so check it separately.
 TOKEN="$(grep -E '^WEBUI_TOKEN=' .env | cut -d= -f2-)"
 models="$(curl -s -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:${PORT}/v1/models" || true)"
 count="$(echo "$models" | python3 -c 'import sys,json;print(len(json.load(sys.stdin).get("data",[])))' 2>/dev/null || echo 0)"
 if [ "${count:-0}" -gt 0 ]; then
-  ok "model list reachable through Open WebUI ($count model(s))"
+  ok "model list reachable ($count model(s))"
+  echo "$models" | python3 -c 'import sys,json;[print("         -",m["id"]) for m in json.load(sys.stdin)["data"]]'
 else
-  warn "/v1/models returned no models — is WEBUI_TOKEN valid, and are models enabled in the UI?"
+  warn "/v1/models returned no models — is WEBUI_TOKEN valid for ${HOST}?"
 fi
-
-# Keys come from Open WebUI's own account page, which is on its own port. With
-# the flag off the UI hides that section and there is no way to obtain one.
-if curl -s -m 5 "http://127.0.0.1:${UI_PORT}/api/config" | grep -q '"enable_api_key": *true'; then
-  ok "Open WebUI reachable on ${UI_PORT} with its API key page enabled"
-else
-  warn "Open WebUI on ${UI_PORT} is down, or its API Keys section is disabled"
-fi
-
 
 say "Ready — http://127.0.0.1:${PORT}"
 cat <<NOTE
-    This port serves the OpenAI API only -- no interface. Open WebUI is on
-    http://127.0.0.1:${UI_PORT}. Requests go through it, never straight to Ollama.
+    This port serves the OpenAI API only. Open WebUI itself is at
+    ${SCHEME}://${HOST}:${UPORT}${BASE}
 
-    token           any Open WebUI token works: the JWT from your browser
-                    session, or an sk- key from Settings -> Account -> API Keys
-    pin it          put it in $HERE/.env as WEBUI_TOKEN, then re-run this script
+    token           any Open WebUI token: the JWT from your browser session
+                    (F12 -> localStorage.token), or Settings -> Account -> API Keys
     vs code         http://127.0.0.1:${PORT}/v1/chat/completions
     run the checks  $HERE/test.sh
     stop            $HERE/init.sh --down
