@@ -12,6 +12,7 @@ PORT="$(grep -E '^LISTEN_PORT=' .env | cut -d= -f2-)"; PORT="${PORT:-8111}"
 BASE="http://127.0.0.1:${PORT}"
 KEY="$(grep -E '^WEBUI_TOKEN=' .env | cut -d= -f2-)"
 UPSTREAM="$(grep -E '^LLM_HOSTNAME=' .env | cut -d= -f2-)"
+TLS_VERIFY="$(grep -E '^UPSTREAM_TLS_VERIFY=' .env | cut -d= -f2-)"; TLS_VERIFY="${TLS_VERIFY:-true}"
 pass=0; fail=0
 
 check() {
@@ -42,6 +43,21 @@ check "LLM_HOSTNAME is set"       '[ -n "$UPSTREAM" ]'
 check "model discovered"          '[ -n "$MODEL" ]'
 check "health needs no token"     '[ "$(code $BASE/health)" = 200 ]'
 check "health names the upstream" 'curl -s $BASE/health | grep -q "\"upstream\""'
+check "health reports the cookie"  'curl -s $BASE/health | grep -q "\"pinned_cookie_configured\""'
+
+echo "== upstream TLS =="
+check "health reports tls posture" 'curl -s $BASE/health | grep -q "upstream_tls_verified"'
+# An https upstream whose certificate is not verified is a silent downgrade; the
+# posture must follow the scheme and UPSTREAM_TLS_VERIFY, nothing else.
+check "posture matches the scheme" 'v=$(curl -s $BASE/health | grep -c "\"upstream_tls_verified\": true"); case "$UPSTREAM" in https://*) [ "$TLS_VERIFY" = false ] && [ "$v" = 0 ] || { [ "$TLS_VERIFY" != false ] && [ "$v" = 1 ]; };; *) [ "$v" = 0 ];; esac'
+check "a CA file, if set, exists"  'f=$(grep -E "^UPSTREAM_CA_FILE=" .env | cut -d= -f2-); [ -z "$f" ] || [ -f "$f" ]'
+# The check init.sh and the 502 both send you to. It must answer for the
+# upstream actually configured, not just parse.
+check "tls-check answers"          'LLM_HOSTNAME="$UPSTREAM" python3 proxy.py --tls-check'
+check "find-ca answers"            'LLM_HOSTNAME="$UPSTREAM" python3 proxy.py --find-ca'
+# --autocert writes files and edits .env, so the check is that it refuses to act
+# without somewhere to put them -- not that it runs against the live upstream.
+check "autocert needs a directory" '! LLM_HOSTNAME="$UPSTREAM" python3 proxy.py --autocert'
 
 echo "== auth is Open WebUI's =="
 check "bogus token -> 401"        '[ "$(code -H "Authorization: Bearer not-a-real-token" $BASE/v1/models)" = 401 ]'

@@ -7,6 +7,8 @@
 #
 #   ./init.sh              # build if needed, up, verify
 #   ./init.sh --no-build   # skip the image build
+#   ./init.sh --tls        # why an https upstream is or is not trusted
+#   ./init.sh --autocert   # fetch the CA it needs, keep it, wire it in
 #   ./init.sh --down       # stop it
 
 set -euo pipefail
@@ -15,11 +17,15 @@ HERE="$(dirname "$(readlink -f "$0")")"
 cd "$HERE"
 
 BUILD=1
+TLS_ONLY=0
+AUTOCERT=0
 for arg in "$@"; do
   case "$arg" in
     --no-build) BUILD=0 ;;
+    --tls)      TLS_ONLY=1 ;;
+    --autocert) AUTOCERT=1 ;;
     --down)     exec docker compose down ;;
-    -h|--help)  sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)  sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown argument: $arg (try --help)" >&2; exit 2 ;;
   esac
 done
@@ -68,6 +74,11 @@ EOF
 [ "$BASE" = "-" ] && BASE=""
 ok "upstream: ${SCHEME}://${HOST}:${UPORT}${BASE}"
 
+# Both keys are optional, and `set -e` would treat a .env without them as fatal.
+CA_FILE="$(grep -E '^UPSTREAM_CA_FILE=' .env | cut -d= -f2- | tr -d '"' | tr -d "'" || true)"
+TLS_VERIFY="$(grep -E '^UPSTREAM_TLS_VERIFY=' .env | cut -d= -f2- || true)"; TLS_VERIFY="${TLS_VERIFY:-true}"
+[ -z "$CA_FILE" ] || [ -f "$CA_FILE" ] || die "UPSTREAM_CA_FILE is set but there is no file at $CA_FILE"
+
 # An unreachable upstream makes every request 502; say so before starting.
 if python3 -c "
 import socket,sys
@@ -80,6 +91,103 @@ except OSError as e:
 else
   warn "cannot reach ${HOST}:${UPORT} from this shell — every request will 502"
   warn "note the container uses host networking, so it resolves names the same way"
+fi
+
+# A certificate the proxy will not trust is the other way every request 502s,
+# and OpenSSL's wording for it names neither cause. proxy.py --tls-check prints
+# the chain the server sends and which certificate would complete it; run inside
+# the container when there is one, because the trust store that decides is the
+# container's, not this shell's.
+tls_check() {
+  if docker compose ps --status running --services 2>/dev/null | grep -q '^proxy$'; then
+    docker compose exec -T proxy python /app/proxy.py --tls-check 2>&1
+  else
+    env LLM_HOSTNAME="$LLM_HOSTNAME" UPSTREAM_CA_BUNDLE="$CA_FILE" \
+        UPSTREAM_TLS_VERIFY="$TLS_VERIFY" python3 proxy.py --tls-check 2>&1
+  fi
+}
+
+report_tls() {  # $1 = "always" to print the chain even when it verifies
+  local out rc
+  if [ "$SCHEME" != "https" ]; then
+    ok "${LLM_HOSTNAME} is plain http — no certificate involved"
+    return 0
+  fi
+  # `set -e` would take a failing check as a reason to stop; it is a finding.
+  out="$(tls_check)" && rc=0 || rc=$?
+  if [ "$rc" = 0 ]; then
+    ok "upstream certificate trusted${CA_FILE:+ (via $CA_FILE)}"
+    if [ "${1:-}" = always ]; then printf '%s\n' "$out" | sed 's/^/         /'; fi
+  else
+    warn "upstream certificate not trusted — every request will 502:"
+    printf '%s\n' "$out" | sed 's/^/         /'
+    # The container's store is the one missing it; this host's may not be, and
+    # an internal CA is usually installed exactly here.
+    warn "looking for that certificate on this host:"
+    env LLM_HOSTNAME="$LLM_HOSTNAME" python3 proxy.py --find-ca 2>&1 | sed 's/^/         /' || true
+    warn "or set UPSTREAM_TLS_VERIFY=false to stop checking (unauthenticated)"
+  fi
+  return $rc
+}
+
+if [ "$TLS_ONLY" = 1 ]; then
+  say "Checking the upstream certificate"
+  report_tls always
+  exit $?
+fi
+
+# Certificates live outside proxy_stack: they are host state, not part of the
+# image, and nothing in the build context should carry them.
+CERTS_DIR="$(cd "$HERE/.." && pwd)/proxy_stack_certs"
+
+set_env_key() {  # key value -- add or replace it in .env, leaving the rest alone
+  if grep -qE "^$1=" .env; then
+    sed -i "s#^$1=.*#$1=$2#" .env
+  else
+    printf '%s=%s\n' "$1" "$2" >> .env
+  fi
+}
+
+if [ "$AUTOCERT" = 1 ]; then
+  say "Fetching the certificate this upstream needs"
+  if [ "$SCHEME" != "https" ]; then
+    ok "${LLM_HOSTNAME} is plain http — no certificate needed"
+    exit 0
+  fi
+  mkdir -p "$CERTS_DIR"
+  # Run on the host: the container is the one that lacks the certificate, and
+  # this host is where it is most likely to already be.
+  out="$(env LLM_HOSTNAME="$LLM_HOSTNAME" UPSTREAM_CA_BUNDLE="$CA_FILE" \
+             python3 proxy.py --autocert "$CERTS_DIR" 2>&1)" && rc=0 || rc=$?
+  printf '%s\n' "$out" | sed 's/^/    /'
+  [ "$rc" = 0 ] || die "could not obtain it — proxy_stack/tls_101.md covers what to ask for"
+
+  pem="$(printf '%s\n' "$out" | sed -n 's/^UPSTREAM_CA_FILE=//p' | tail -1)"
+  if [ -z "$pem" ]; then
+    ok "nothing to change"
+    exit 0
+  fi
+  set_env_key UPSTREAM_CA_FILE "$pem"
+  ok "UPSTREAM_CA_FILE written to .env"
+  if [ "$TLS_VERIFY" = "false" ]; then
+    set_env_key UPSTREAM_TLS_VERIFY true
+    ok "UPSTREAM_TLS_VERIFY back to true — the escape hatch is not needed now"
+  fi
+  CA_FILE="$pem"; TLS_VERIFY=true
+
+  say "Applying it"
+  docker compose up -d --wait
+  docker compose ps --format '    {{.Name}}  {{.Status}}'
+  report_tls always
+  exit $?
+fi
+
+if [ "$SCHEME" = "https" ]; then
+  if [ "$TLS_VERIFY" = "false" ]; then
+    warn "UPSTREAM_TLS_VERIFY=false — the upstream certificate will not be checked"
+  else
+    report_tls || true
+  fi
 fi
 
 # Only a conflict we did not create ourselves matters.

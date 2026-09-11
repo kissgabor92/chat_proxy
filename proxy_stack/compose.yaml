@@ -29,9 +29,26 @@ services:
       # An Open WebUI token used when the caller sends none.
       WEBUI_TOKEN: ${WEBUI_TOKEN:-}
 
+      # A Cookie header to send upstream, for an Open WebUI behind a gateway that
+      # authenticates by session cookie rather than by bearer token.
+      UPSTREAM_COOKIE: ${UPSTREAM_COOKIE:-}
+
       # true = a caller must present its own bearer token even when WEBUI_TOKEN
       # is set; the pinned token is then only the upstream credential.
       REQUIRE_CLIENT_TOKEN: ${REQUIRE_CLIENT_TOKEN:-false}
+
+      # Set only when UPSTREAM_CA_FILE names a CA on the host: the path the
+      # mount below puts it at inside the container.
+      UPSTREAM_CA_BUNDLE: ${UPSTREAM_CA_FILE:+/etc/ssl/upstream-ca.pem}
+
+      # false = accept any upstream certificate. Last resort; see .env.example.
+      UPSTREAM_TLS_VERIFY: ${UPSTREAM_TLS_VERIFY:-true}
+
+    volumes:
+      # The CA that signed an https upstream's certificate, when a public one
+      # did not. Unset, this mounts /dev/null and UPSTREAM_CA_BUNDLE stays
+      # empty, so the image's own root store is used untouched.
+      - ${UPSTREAM_CA_FILE:-/dev/null}:/etc/ssl/upstream-ca.pem:ro
 
     healthcheck:
       test: ["CMD", "python", "-c",

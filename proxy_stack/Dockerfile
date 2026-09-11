@@ -2,6 +2,9 @@
 # underneath it must not move on a rebuild.
 FROM python:3.13-alpine@sha256:46ee549c88617e9bc8acb843a326f1a5c0fa5608d7f9703509efe6d53b55f318
 
+# The public root store comes with this image (ca-certificates-bundle), so an
+# https upstream with a public certificate needs nothing here. A private CA is
+# mounted in at run time instead -- see UPSTREAM_CA_FILE in compose.yaml.
 WORKDIR /app
 COPY proxy.py /app/
 

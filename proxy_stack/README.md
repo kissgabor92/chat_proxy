@@ -12,7 +12,8 @@ proxy_stack/
 ├── proxy.py         the whole service, stdlib only
 ├── Dockerfile       python:3.13-alpine pinned by digest
 ├── compose.yaml     one service, host networking
-├── test.sh          26 checks, the definition of done
+├── test.sh          33 checks, the definition of done
+├── tls_101.md       trusting an https upstream, and the gateway in front of it
 ├── .env             LLM_HOSTNAME + WEBUI_TOKEN (git-ignored)
 └── .env.example
 ```
@@ -39,13 +40,105 @@ host:port, or a full URL with a base path — all of these work:
 A value that is not a usable host, or a scheme other than http/https, is refused at startup
 with a message saying which — not a DNS error thirty seconds later.
 
+### An https upstream with a certificate the container does not trust
+
+`./init.sh --autocert` does the whole thing in one command — finds the certificate the
+upstream needs, keeps it in `proxy_stack_certs/`, wires it into `.env` and re-checks. Short
+version below; **[tls_101.md](tls_101.md)** is the whole walkthrough — how verification
+works, how to fetch the certificate from your PKI, and what to do when it still fails.
+
+The image carries the public root store, so a certificate from a public CA just works.
+Anything else fails every request with one message:
+
+```
+CERTIFICATE_VERIFY_FAILED ... unable to get local issuer certificate
+```
+
+That wording covers **two different faults with different fixes**, and names neither:
+
+| What is wrong | What fixes it |
+| --- | --- |
+| The certificate is signed by a CA the container does not have (company or self-signed) | Trust that CA |
+| The server sends only its own certificate and not the intermediate above it | Trust the **intermediate** — the root alone will not bridge the gap |
+
+The second is the common one behind a reverse proxy, and it is the reason "point it at your
+root CA" can leave the error byte-for-byte unchanged. So don't guess — ask:
+
+```bash
+./init.sh --tls
+```
+
+It prints the chain the server actually sends and names the certificate that would complete
+it, with the URL it is published at when the certificate carries one:
+
+```
+https://ai.example.com:443 sends 1 certificate(s):
+  0. ai.example.com
+     issued by Example Issuing CA
+
+NOT trusted: unable to get local issuer certificate
+the server sent only its own certificate, so nothing links it to a root.
+the chain stops at 'ai.example.com', and its issuer 'Example Issuing CA' is not in this trust store.
+get the certificate for 'Example Issuing CA' -- and any above it, up to the root --
+  it is usually published at http://pki.example.com/issuing-ca.crt
+put them all in one PEM file and set UPSTREAM_CA_FILE to it.
+```
+
+It runs **inside the container** whenever one is up, because the trust store that decides is
+the container's, not your shell's. When the certificate is untrusted it then searches **this
+host** for the one that is missing — an internal CA is usually installed on the machines
+that need it and nowhere else, so the file that fixes the container is often already here:
+
+```
+looking for that certificate on this host:
+  this host already trusts 'Example Issuing CA'. It is in:
+    /usr/local/share/ca-certificates/example-issuing.crt
+    /etc/ssl/certs/ca-certificates.crt
+
+  verified: 2 of them complete the chain to https://ai.example.com:443:
+    /usr/local/share/ca-certificates/example-issuing.crt
+    /etc/ssl/certs/ca-certificates.crt
+  the container does not have it, so hand it one of those -- in .env:
+    UPSTREAM_CA_FILE=/usr/local/share/ca-certificates/example-issuing.crt
+```
+
+Each candidate is **tried**, not guessed at: a file holding the right name still fails if
+the certificate above it is missing too, and the check says so instead of recommending it.
+If this host does not have it either, you need it from whoever runs the CA — or exported
+from a browser that trusts the site. Then:
+
+```bash
+# proxy_stack/.env
+UPSTREAM_CA_FILE=/etc/ssl/certs/company-chain.pem   # a path on THIS host
+```
+
+Everything in that file is trusted **in addition to** the public roots, so a mixed estate
+keeps working — concatenate as many certificates as the chain needs. `init.sh` refuses to
+start if the path does not exist, and the proxy exits at startup, rather than 502ing on
+every request, if the file is not readable PEM.
+
+If the cause is the missing intermediate, the real fix is in that server's chain; trusting
+it here is the workaround that does not disable verification.
+
+```bash
+UPSTREAM_TLS_VERIFY=false    # last resort: accept any certificate
+```
+
+This drops the only check that the host answering is the one you named — anything able to
+intercept that connection sees the token and the conversation. `/health` reports which is
+in force as `upstream_tls_verified`, `init.sh` warns on every start, `--tls` still reports
+what verification *would* find, and `test.sh` asserts the posture matches the scheme so an
+https upstream cannot be silently downgraded.
+
 ## Run it
 
 ```bash
 ./init.sh            # build, up, verify
 ./init.sh --no-build # skip the image build
+./init.sh --tls      # why an https upstream is or is not trusted
+./init.sh --autocert # fetch the CA an https upstream needs, keep it, wire it in
 ./init.sh --down     # stop
-./test.sh            # 26 checks
+./test.sh            # 33 checks
 ```
 
 `init.sh` resolves `LLM_HOSTNAME` the same way `proxy.py` does, checks the upstream is
@@ -98,6 +191,32 @@ always wins.
 > want, set `REQUIRE_CLIENT_TOKEN=true` — the pinned token then acts purely as the upstream
 > credential. `/health` reports which mode is active, and so does `init.sh`.
 
+### Behind an SSO gateway
+
+Some deployments put a gateway in front of Open WebUI that authenticates by **session
+cookie**, not by bearer token. A request carrying only a token is anonymous to it, and it
+refuses before Open WebUI ever sees it:
+
+```json
+{"detail": "no session ID found"}
+```
+
+The 401 comes from the gateway, so no Open WebUI token will fix it. Give the proxy the
+cookie instead — from a browser that is logged in, F12 → Application → Cookies:
+
+```bash
+# proxy_stack/.env
+UPSTREAM_COOKIE=session=a1b2c3...
+```
+
+It is sent with every upstream request, and a caller's own `Cookie` header wins over it,
+exactly as with the token. `/health` reports `pinned_cookie_configured`, and when the
+upstream answers 401 or 403 with no cookie in play the proxy says so in its log.
+
+> A session cookie carries the same weight as a password and **expires** — expect to refresh
+> it. If the gateway can issue a long-lived API key or a bypass for service traffic, that is
+> the better credential.
+
 > Open WebUI stores **one API key per user**: creating a new one in the UI retires the
 > previous one, so a key pinned in `.env` stops working the moment you press Create again.
 > `test.sh` deliberately never mints a key for this reason.
@@ -149,6 +268,10 @@ The config lands in `~/.config/Code/User/chatLanguageModels.json`:
 ## Troubleshooting
 
 - **Every request 502s** — the upstream is unreachable. `curl $LLM_HOSTNAME/api/config` from this host; `init.sh` checks this before starting.
+- **502 `CERTIFICATE_VERIFY_FAILED` / `unable to get local issuer certificate`** — run `./init.sh --tls`: it names the certificate that is missing, which is not always the root. See [above](#an-https-upstream-with-a-certificate-the-container-does-not-trust).
+- **Trusting the root CA did not help** — the server is probably not sending its intermediate; that intermediate has to be in `UPSTREAM_CA_FILE` too. `./init.sh --tls` says so explicitly.
+- **An internal CA that is on the host but not in the container** — `./init.sh --tls` finds the file and prints the `UPSTREAM_CA_FILE=` line to paste. The container is deliberately not given the host's store wholesale; it gets the one file you name.
+- **`{"detail": "no session ID found"}` or a 401 that mentions a session** — that is a gateway in front of Open WebUI, not Open WebUI. Set `UPSTREAM_COOKIE`; see [Behind an SSO gateway](#behind-an-sso-gateway).
 - **401** — the token was revoked, or `.env` was edited without recreating the container. Editing `.env` alone does not reach a running container; re-run `./init.sh --no-build`.
 - **`/v1/models` is empty** — the token is valid but Open WebUI exposes no models to that user. Check the model list in the UI first.
 - **A tool is never called** — confirm `finish_reason` comes back as `tool_calls`; `test.sh` checks exactly this.

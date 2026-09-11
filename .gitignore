@@ -1,10 +1,8 @@
-# Ollama model weights, left in place from the removed llm_stack: ~13 GB, and
-# still bind-mounted by a running container. These must never enter git
-# history, where they would be effectively unremovable.
-/llm_stack/
-
-__pycache__/
-*.pyc
+# Ollama model weights live under llm_stack/ollama by project choice.
+# gpt-oss:20b alone is ~14 GB -- these must never enter git history, where
+# they would be effectively unremovable.
+/llm_stack/ollama/
+!/llm_stack/ollama/.gitkeep
 
 # IntelliJ output dir declared in .idea/misc.xml
 /out/
@@ -15,3 +13,14 @@ __pycache__/
 !.env.example
 compose.override.yaml
 compose.override.yml
+
+
+.idea
+.idea/*
+*.iml
+
+proxy_stack/__pycache__
+proxy_stack/__pycache__/*
+# Fetched by ./init.sh --autocert: CA certificates for an https upstream.
+# Public material, but host state -- it belongs to the machine, not the repo.
+/proxy_stack_certs/
