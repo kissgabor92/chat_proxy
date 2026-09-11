@@ -1,0 +1,50 @@
+name: chat-proxy-vscode
+
+services:
+  proxy:
+    build: .
+    image: chat-proxy-vscode:1.0
+    container_name: chat-proxy-vscode
+    restart: unless-stopped
+
+    environment:
+      # Open WebUI is the only upstream. Ollama sits behind it and is never
+      # addressed from here, so Open WebUI's model permissions always apply.
+      WEBUI_HOST: webui
+      WEBUI_PORT: "8080"
+      LISTEN_PORT: "8111"
+      # The token requests travel upstream with when the caller supplies none.
+      # Copy it from the `token` field of GET /api/v1/auths/, or from the
+      # account page's API Keys section. Supplied from .env, which the
+      # repo-root .gitignore already covers.
+      WEBUI_TOKEN: ${WEBUI_TOKEN:-}
+      # true = a caller must present its own bearer token even when WEBUI_TOKEN
+      # is pinned. false = an unauthenticated caller is served using the pinned
+      # token, which is what lets VS Code be configured with a placeholder key.
+      REQUIRE_CLIENT_TOKEN: ${REQUIRE_CLIENT_TOKEN:-false}
+
+    # Loopback only, like every other container on this host. This is the
+    # single front door: the browser UI and the VS Code endpoint both arrive
+    # here, and neither webui:8080 nor ollama:11434 is published.
+    ports:
+      - "127.0.0.1:8111:8111"
+
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8111/health',timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
+
+    networks:
+      - chat-proxy
+
+networks:
+  # External on purpose. llm_stack/compose.yaml sets project name `chat-proxy`
+  # and owns this network; declaring it normally from a different project name
+  # would make Docker create `chat-proxy-vscode_chat-proxy` instead, and the
+  # hostname `ollama` would stop resolving.
+  chat-proxy:
+    external: true
+    name: chat-proxy

@@ -1,0 +1,22 @@
+# Ollama model weights live under llm_stack/ollama by project choice.
+# gpt-oss:20b alone is ~14 GB -- these must never enter git history, where
+# they would be effectively unremovable.
+/llm_stack/ollama/
+!/llm_stack/ollama/.gitkeep
+
+# IntelliJ output dir declared in .idea/misc.xml
+/out/
+
+# Local overrides and secrets
+.env
+.env.*
+!.env.example
+compose.override.yaml
+compose.override.yml
+
+
+.idea
+.idea/*
+
+proxy_stack/__pycache__
+proxy_stack/__pycache__/*

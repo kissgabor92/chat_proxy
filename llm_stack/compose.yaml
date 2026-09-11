@@ -1,0 +1,119 @@
+name: chat-proxy
+
+services:
+  ollama:
+    image: ollama/ollama:0.12.3
+    container_name: chat-proxy-ollama
+    restart: unless-stopped
+
+    # GPU passed through as plain device nodes.
+    #
+    # The device nodes alone are NOT enough: the image ships the CUDA runtime
+    # (libcublas, libcudart) but not libcuda.so, the driver library, which must
+    # come from the host and match the running driver. With devices only,
+    # Ollama logs "no compatible GPUs were discovered" and silently serves from
+    # the CPU. The four library mounts below are what make this work.
+    #
+    # They are bound via their .so.1 / .so.4 symlinks rather than the versioned
+    # filenames, so a driver upgrade does not break the mount.
+    devices:
+      - /dev/nvidia0:/dev/nvidia0
+      - /dev/nvidiactl:/dev/nvidiactl
+      - /dev/nvidia-uvm:/dev/nvidia-uvm
+      - /dev/nvidia-uvm-tools:/dev/nvidia-uvm-tools
+
+    # Run as the host user so model weights bind-mounted into the project tree
+    # stay owned by uid 1000 instead of root.
+    user: "1000:1000"
+
+    environment:
+      HOME: /ollama
+      OLLAMA_MODELS: /ollama/models
+      OLLAMA_HOST: 0.0.0.0:11434
+      # Keep a 14 GB model resident between messages instead of reloading it.
+      OLLAMA_KEEP_ALIVE: "30m"
+      # VS Code sends large prompts; the Ollama default of 4096 silently
+      # truncates them. 16384 was measured to still load 100% on GPU.
+      OLLAMA_CONTEXT_LENGTH: "16384"
+
+    volumes:
+      - ./ollama:/ollama
+      # NVIDIA driver libraries -- see the note above the devices: block.
+      - /usr/lib/x86_64-linux-gnu/libcuda.so.1:/usr/lib/x86_64-linux-gnu/libcuda.so.1:ro
+      - /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1:/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1:ro
+      - /usr/lib/x86_64-linux-gnu/libnvidia-ptxjitcompiler.so.1:/usr/lib/x86_64-linux-gnu/libnvidia-ptxjitcompiler.so.1:ro
+      - /usr/lib/x86_64-linux-gnu/libnvidia-nvvm.so.4:/usr/lib/x86_64-linux-gnu/libnvidia-nvvm.so.4:ro
+
+    # Deliberately NOT published to the host. Ollama has no authentication of
+    # its own and its API can pull and run arbitrary models; the web UI reaches
+    # it over the project network instead.
+    expose:
+      - "11434"
+
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+    networks:
+      - chat-proxy
+
+  webui:
+    image: ghcr.io/open-webui/open-webui:v0.6.30-slim
+    container_name: chat-proxy-webui
+    restart: unless-stopped
+
+    depends_on:
+      ollama:
+        condition: service_healthy
+
+    environment:
+      OLLAMA_BASE_URL: http://ollama:11434
+      # Pinned from .env. Without it Open WebUI generates a new signing key on
+      # every container recreation and silently invalidates every API token and
+      # browser session -- its own start.sh persists the key to
+      # /app/backend/.webui_secret_key, which is in the image, not the volume.
+      WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY:?set WEBUI_SECRET_KEY in llm_stack/.env}
+      # Auth is left at the upstream default. WEBUI_AUTH=False is tempting for a
+      # loopback-only stack, but Open WebUI refuses it the moment any account
+      # exists ("You can't turn off authentication because there are existing
+      # users"), which strands the instance behind a login it will not accept.
+      # First visit asks you to create a local admin account; it lives in the
+      # chat-proxy-openwebui-data volume and never leaves this machine.
+      # The -slim image ships no bundled embedding model; point retrieval at
+      # Ollama so the container never reaches out to HuggingFace at runtime.
+      RAG_EMBEDDING_ENGINE: ollama
+      # Open WebUI's API key settings are deliberately left at their defaults:
+      # its account page issues the keys that authenticate the bridge in
+      # ../proxy_stack. Forcing ENABLE_API_KEY=False here would also require
+      # ENABLE_PERSISTENT_CONFIG=False, which makes Open WebUI discard every
+      # setting saved through its admin UI and silently re-open signup.
+      ANONYMIZED_TELEMETRY: "False"
+      SCARF_NO_ANALYTICS: "true"
+      DO_NOT_TRACK: "true"
+
+    # The Open WebUI interface, on its own port. The OpenAI endpoint in
+    # ../proxy_stack is a separate service on 8111 and serves no UI, so which
+    # port you are talking to always tells you which service answers.
+    # 8080 on this host is held by pewstack-pewshare-backend, so the upstream
+    # 8080:8080 mapping would collide; 3000 is free.
+    ports:
+      - "127.0.0.1:3000:8080"
+
+    volumes:
+      - openwebui-data:/app/backend/data
+
+    networks:
+      - chat-proxy
+
+volumes:
+  # UI state (conversations, settings) stays in a named volume -- only the
+  # model weights were asked for in the project tree.
+  openwebui-data:
+    name: chat-proxy-openwebui-data
+
+networks:
+  chat-proxy:
+    name: chat-proxy
