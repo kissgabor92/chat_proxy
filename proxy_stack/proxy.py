@@ -30,10 +30,17 @@ Standard library only. It exists to translate, not to decide:
 1. Open WebUI answers on /api/... paths, not the /v1/... an OpenAI-compatible
    client expects, and its model list carries fields no such client reads.
 
-2. Its replies deviate from the OpenAI schema in two ways that matter to VS
-   Code -- a non-standard `reasoning_content` field, and `finish_reason` left as
+2. Its replies deviate from the OpenAI schema in three ways that matter to VS
+   Code -- a non-standard `reasoning_content` field; `finish_reason` left as
    "stop" on a response that actually carries tool_calls, which an agent reads
-   as "the model is done" and so never runs the tool.
+   as "the model is done" and so never runs the tool; and a stream that ends
+   with `[DONE]` without ever setting a finish_reason, which a client reads as
+   "no choice was completed" and discards.
+
+3. Whether the reply is a stream or a single JSON body is decided by what
+   comes back, not by what the caller asked for: a caller that wanted JSON gets
+   JSON even when the upstream streams, and a caller that wanted a stream gets
+   a stream even when the upstream answers in one piece.
 """
 
 import http.client
@@ -604,6 +611,18 @@ def tls_check():
     return 0
 
 
+def finish_for(has_tool_calls, upstream_reason):
+    """The finish_reason a choice should carry.
+
+    Open WebUI reports "stop" on a message that carries tool_calls, and in a
+    stream often reports nothing at all. Either way an agent needs
+    "tool_calls" to know it must run the tool.
+    """
+    if has_tool_calls and upstream_reason in (None, "stop"):
+        return "tool_calls"
+    return upstream_reason or "stop"
+
+
 def normalise(choice):
     """Bring one Open WebUI choice back to the OpenAI schema.
 
@@ -621,9 +640,73 @@ def normalise(choice):
     reasoning = message.pop("reasoning_content", None)
     if not message.get("content") and reasoning and not message.get("tool_calls"):
         message["content"] = reasoning
-    if message.get("tool_calls") and choice.get("finish_reason") == "stop":
-        choice["finish_reason"] = "tool_calls"
+    choice["finish_reason"] = finish_for(bool(message.get("tool_calls")),
+                                         choice.get("finish_reason"))
     return choice
+
+
+def sse_chunks(response):
+    """Yield each parsed `data:` JSON object of an SSE stream, up to [DONE]."""
+    for line in response:
+        if not line.startswith(b"data: "):
+            continue
+        data = line[6:].strip()
+        if data == b"[DONE]":
+            return
+        try:
+            yield json.loads(data)
+        except json.JSONDecodeError:
+            continue
+
+
+def collect_stream(response):
+    """Fold an SSE stream into one chat.completion body.
+
+    For a caller that asked for a single JSON reply from an upstream that
+    streams anyway. Tool-call fragments are merged by index, the way an OpenAI
+    client would, so the result is the same shape a non-streaming upstream
+    returns and goes through normalise() like one.
+    """
+    content, reasoning, tool_calls = [], [], {}
+    finish, last, usage = None, {}, None
+    for chunk in sse_chunks(response):
+        last = chunk
+        if chunk.get("usage"):
+            usage = chunk["usage"]
+        for choice in chunk.get("choices", []):
+            delta = choice.get("delta") or {}
+            if delta.get("reasoning_content"):
+                reasoning.append(delta["reasoning_content"])
+            if delta.get("content"):
+                content.append(delta["content"])
+            for tc in delta.get("tool_calls") or []:
+                slot = tool_calls.setdefault(tc.get("index", 0), {
+                    "id": None, "type": "function",
+                    "function": {"name": "", "arguments": ""}})
+                if tc.get("id"):
+                    slot["id"] = tc["id"]
+                fn = tc.get("function") or {}
+                if fn.get("name"):
+                    slot["function"]["name"] = fn["name"]
+                if fn.get("arguments"):
+                    slot["function"]["arguments"] += fn["arguments"]
+            if choice.get("finish_reason"):
+                finish = choice["finish_reason"]
+    message = {"role": "assistant", "content": "".join(content) or None}
+    if reasoning:
+        message["reasoning_content"] = "".join(reasoning)
+    if tool_calls:
+        message["tool_calls"] = [tool_calls[i] for i in sorted(tool_calls)]
+    body = {
+        "id": last.get("id", "chatcmpl-collected"),
+        "object": "chat.completion",
+        "created": last.get("created", 0),
+        "model": last.get("model", ""),
+        "choices": [{"index": 0, "message": message, "finish_reason": finish}],
+    }
+    if usage:
+        body["usage"] = usage
+    return body
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -795,26 +878,31 @@ class Handler(BaseHTTPRequestHandler):
         if resp.status >= 400:
             return self.relay_error(resp.status, resp.read())
 
-        if wants_stream:
-            return self.relay_stream(resp)
+        # What the upstream did, not what was asked: Open WebUI can stream for
+        # a model or pipe regardless of the request, and can answer in one
+        # piece when asked to stream. The caller gets the shape it asked for
+        # either way.
+        upstream_streams = "text/event-stream" in (resp.getheader("Content-Type") or "")
 
-        try:
-            data = json.loads(resp.read())
-        except json.JSONDecodeError as exc:
-            return self.send_detail(502, "unreadable completion: %s" % exc)
+        if wants_stream:
+            if upstream_streams:
+                return self.relay_stream(resp)
+            return self.stream_from_completion(resp)
+
+        if upstream_streams:
+            data = collect_stream(resp)
+        else:
+            try:
+                data = json.loads(resp.read())
+            except json.JSONDecodeError as exc:
+                return self.send_detail(502, "unreadable completion: %s" % exc)
         for choice in data.get("choices", []):
             normalise(choice)
         return self.send_json(200, data)
 
-    def relay_stream(self, response):
-        """Re-emit Open WebUI's SSE as OpenAI-shaped chunks.
+    # ---------- streaming ----------
 
-        `reasoning_content` deltas are accumulated rather than forwarded: they
-        are not an OpenAI field, and a chunk carrying only reasoning has no
-        content to render. If the stream ends having produced no content at all,
-        the accumulation is flushed as one content chunk so the reply is never
-        blank.
-        """
+    def start_stream(self):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -822,29 +910,65 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.close_connection = True
 
-        saw_content = False
-        reasoning_parts = []
-        last_chunk = None
+    def emit(self, blob):
+        self.wfile.write(blob)
+        self.wfile.flush()
 
-        def emit(blob):
-            self.wfile.write(blob)
-            self.wfile.flush()
+    def emit_chunk(self, like, delta, finish_reason, index=0):
+        """One chat.completion.chunk, borrowing id/model from a real one."""
+        self.emit(b"data: " + json.dumps({
+            "id": like.get("id", "chatcmpl-bridge"),
+            "object": "chat.completion.chunk",
+            "created": like.get("created", 0),
+            "model": like.get("model", ""),
+            "choices": [{"index": index, "delta": delta,
+                         "finish_reason": finish_reason}],
+        }).encode() + b"\n\n")
+
+    def stream_from_completion(self, response):
+        """A caller asked for a stream; the upstream answered in one piece.
+
+        Each choice becomes a single chunk carrying the whole message as its
+        delta, followed by [DONE] -- the minimum a streaming client can consume.
+        """
+        try:
+            data = json.loads(response.read())
+        except json.JSONDecodeError as exc:
+            return self.send_detail(502, "unreadable completion: %s" % exc)
+        self.start_stream()
+        try:
+            for i, choice in enumerate(data.get("choices", [])):
+                normalise(choice)
+                delta = dict(choice.get("message") or {})
+                delta.setdefault("role", "assistant")
+                self.emit_chunk(data, delta, choice.get("finish_reason"), index=i)
+            self.emit(b"data: [DONE]\n\n")
+        except (BrokenPipeError, ConnectionResetError):
+            log("client disconnected mid-stream")
+
+    def relay_stream(self, response):
+        """Re-emit Open WebUI's SSE as OpenAI-shaped chunks.
+
+        `reasoning_content` deltas are accumulated rather than forwarded: they
+        are not an OpenAI field, and a chunk carrying only reasoning has no
+        content to render. If the stream ends having produced neither content
+        nor a tool call, the accumulation is flushed as one content chunk so
+        the reply is never blank. A stream that produced a tool call is NOT
+        given its reasoning as content: that reads as the assistant's answer
+        and hides the tool call behind it.
+
+        Open WebUI's stream may end at [DONE] with finish_reason still null on
+        every chunk. A client needs a finished choice to accept the reply, so
+        one is always emitted: "tool_calls" if any were sent, else "stop".
+        """
+        self.start_stream()
+
+        saw_content = saw_tool_calls = saw_finish = False
+        reasoning_parts = []
+        last_chunk = {}
 
         try:
-            for line in response:
-                if not line.strip():
-                    continue
-                if not line.startswith(b"data: "):
-                    emit(line)
-                    continue
-                data = line[6:].strip()
-                if data == b"[DONE]":
-                    break
-                try:
-                    chunk = json.loads(data)
-                except json.JSONDecodeError:
-                    continue
-
+            for chunk in sse_chunks(response):
                 last_chunk = chunk
                 keep = False
                 for choice in chunk.get("choices", []):
@@ -854,28 +978,27 @@ class Handler(BaseHTTPRequestHandler):
                         reasoning_parts.append(reasoning)
                     if delta.get("content"):
                         saw_content = True
-                    if delta.get("tool_calls") and choice.get("finish_reason") == "stop":
-                        choice["finish_reason"] = "tool_calls"
+                    if delta.get("tool_calls"):
+                        saw_tool_calls = True
+                    if choice.get("finish_reason"):
+                        choice["finish_reason"] = finish_for(saw_tool_calls,
+                                                             choice["finish_reason"])
+                        saw_finish = True
                     # A delta emptied by stripping carries no information, and
                     # forwarding it makes a client count empty tokens.
                     if delta or choice.get("finish_reason"):
                         keep = True
                 if keep:
-                    emit(b"data: " + json.dumps(chunk).encode() + b"\n\n")
+                    self.emit(b"data: " + json.dumps(chunk).encode() + b"\n\n")
 
-            if not saw_content and reasoning_parts:
-                emit(b"data: " + json.dumps({
-                    "id": (last_chunk or {}).get("id", "chatcmpl-fallback"),
-                    "object": "chat.completion.chunk",
-                    "created": (last_chunk or {}).get("created", 0),
-                    "model": (last_chunk or {}).get("model", ""),
-                    "choices": [{"index": 0,
-                                 "delta": {"role": "assistant",
-                                           "content": "".join(reasoning_parts)},
-                                 "finish_reason": None}],
-                }).encode() + b"\n\n")
+            if not saw_content and not saw_tool_calls and reasoning_parts:
+                self.emit_chunk(last_chunk,
+                                {"role": "assistant", "content": "".join(reasoning_parts)},
+                                None)
+            if not saw_finish:
+                self.emit_chunk(last_chunk, {}, finish_for(saw_tool_calls, None))
 
-            emit(b"data: [DONE]\n\n")
+            self.emit(b"data: [DONE]\n\n")
         except (BrokenPipeError, ConnectionResetError):
             log("client disconnected mid-stream")
 

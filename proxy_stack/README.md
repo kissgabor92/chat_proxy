@@ -231,7 +231,9 @@ was measured, not assumed.
 | `/api/models` entries carry `tags`, `actions`, `filters`, `connection_type` | Reduced to the OpenAI list schema — `id`, `object`, `created`, `owned_by` |
 | Replies carry `reasoning_content`, which is not an OpenAI field | Dropped; promoted to `content` first if the model left `content` empty, so a reply is never blank |
 | **`finish_reason` is `"stop"` on a response that contains `tool_calls`** | Corrected to `"tool_calls"`. An agent reads `"stop"` as *the model is done* and so never runs the tool |
-| Streaming deltas carry `reasoning_content`, sometimes with no content at all | Accumulated, not forwarded; flushed as one content chunk only if the stream produced no content. Deltas emptied by stripping are dropped rather than sent as empty tokens |
+| Streaming deltas carry `reasoning_content`, sometimes with no content at all | Accumulated, not forwarded; flushed as one content chunk only if the stream produced neither content nor a tool call. Deltas emptied by stripping are dropped rather than sent as empty tokens |
+| **A streamed tool call ends at `[DONE]` with `finish_reason` null on every chunk** | A finishing chunk is always emitted — `"tool_calls"` if any were sent, else `"stop"`. Without it VS Code reports *Response contained no choices* and discards the reply |
+| The reply shape follows Open WebUI's mood, not the request: a stream for a caller that wanted JSON, or one JSON body for a caller that wanted a stream | Decided by the upstream `Content-Type`, not the request. A stream is folded into one `chat.completion` (tool-call fragments merged by index); a single body is wrapped as one chunk plus `[DONE]`. The caller always gets what it asked for |
 
 Everything else — `tools`, `tool_calls`, `usage`, model ids, the request body itself — is
 forwarded unchanged. The body is parsed only to learn whether the caller asked for a

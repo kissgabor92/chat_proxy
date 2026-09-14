@@ -37,6 +37,7 @@ ASK="{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"say OK
 TINY="{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"say OK\"}],\"stream\":false,\"max_tokens\":20}"
 STREAM="{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"say OK\"}],\"stream\":true,\"max_tokens\":80}"
 TOOLS="{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"Weather in Paris? Use the tool.\"}],\"stream\":false,\"max_tokens\":300,\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"description\":\"Get weather\",\"parameters\":{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"}},\"required\":[\"city\"]}}}]}"
+TOOLS_STREAM="${TOOLS/\"stream\":false/\"stream\":true}"
 
 echo "== configuration =="
 check "LLM_HOSTNAME is set"       '[ -n "$UPSTREAM" ]'
@@ -84,6 +85,12 @@ check "returns tool_calls"        'post "$TOOLS" | grep -q tool_calls'
 # Open WebUI reports finish_reason "stop" on a response carrying tool_calls; an
 # agent reads that as "done" and never runs the tool.
 check "finish_reason corrected"   'post "$TOOLS" | python3 -c "import sys,json;c=json.load(sys.stdin)[\"choices\"][0];sys.exit(0 if c.get(\"finish_reason\")==\"tool_calls\" else 1)"'
+# Streamed, Open WebUI ends at [DONE] with finish_reason null on every chunk;
+# a client then reports "Response contained no choices". The stream must end
+# with a finished choice, and its reasoning must not be shown as the answer.
+check "streamed call finishes"    'post "$TOOLS_STREAM" | grep "^data: {" | tail -1 | grep -q "\"finish_reason\": \"tool_calls\""'
+check "streamed call has tool"    'post "$TOOLS_STREAM" | grep -q "\"tool_calls\""'
+check "no reasoning as content"   '! post "$TOOLS_STREAM" | grep -q "\"role\": \"assistant\", \"content\": \"[^\"]"'
 
 echo "== serves the API only =="
 check "/ is 404, not the UI"      '[ "$(code $BASE/)" = 404 ]'
