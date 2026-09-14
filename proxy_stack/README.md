@@ -253,7 +253,7 @@ The config lands in `~/.config/Code/User/chatLanguageModels.json`:
   "toolCalling": true,
   "vision": false,
   "maxOutputTokens": 4096,
-  "contextWindow": 16384,
+  "contextWindow": 32768,
   "streaming": true
 }
 ```
@@ -261,12 +261,17 @@ The config lands in `~/.config/Code/User/chatLanguageModels.json`:
 - **`id` is sent as the model name and must match `/v1/models` exactly**, colon included.
   `name` is only a display label. Swapping them yields `400 {"detail":"Model not found"}`.
 - `contextWindow` must not exceed what the upstream model actually serves; claiming more
-  does not raise the limit, it makes prompts silently truncate.
+  does not raise the limit, it makes prompts silently truncate. Claiming *less* is the
+  other failure: Copilot counts the prompt before sending and refuses with **"Message
+  exceeds token limit"** once its agent-mode system prompt and tool definitions outgrow
+  `contextWindow - maxOutputTokens`. 16384 is too small for that; `../llm_stack` serves
+  32768, the most that stays fully on a 16 GB GPU with gpt-oss:20b.
 - VS Code reads this file **at window startup**. After editing it, reload the window — and
   re-pick the model, since the remembered selection is stored by id.
 
 ## Troubleshooting
 
+- **VS Code: "Sorry, your request failed ... Message exceeds token limit"** — raised by Copilot before any request reaches this proxy: the prompt is larger than `contextWindow - maxOutputTokens` in `chatLanguageModels.json`. Raise `contextWindow` to what the upstream really serves (`OLLAMA_CONTEXT_LENGTH` in `../llm_stack/compose.yaml`), reload the window, and re-pick the model.
 - **Every request 502s** — the upstream is unreachable. `curl $LLM_HOSTNAME/api/config` from this host; `init.sh` checks this before starting.
 - **502 `CERTIFICATE_VERIFY_FAILED` / `unable to get local issuer certificate`** — run `./init.sh --tls`: it names the certificate that is missing, which is not always the root. See [above](#an-https-upstream-with-a-certificate-the-container-does-not-trust).
 - **Trusting the root CA did not help** — the server is probably not sending its intermediate; that intermediate has to be in `UPSTREAM_CA_FILE` too. `./init.sh --tls` says so explicitly.

@@ -1,0 +1,96 @@
+# A stand-in for a session-cookie gateway in front of Open WebUI.
+#
+# The Open WebUI this proxy will eventually front sits behind a gateway that
+# authenticates by session cookie, not by bearer token, and refuses anything
+# without one before Open WebUI ever sees it. This nginx reproduces exactly
+# that so ../proxy_stack can be exercised against it locally:
+#
+#   no `session` cookie, or the wrong value   -> 401 {"detail": "no session ID found"}
+#     ... unless the caller is a browser      -> 302 to /gateway/login
+#   the pinned value                          -> passed through to Open WebUI
+#
+# A browser is recognised by asking for text/html. The proxy in ../proxy_stack
+# sends no Accept header and curl sends */*, so both keep getting the JSON 401
+# a real gateway gives API traffic, while a person typing the URL lands on the
+# login route the way an SSO would send them.
+#
+# The nginx image renders this template with envsubst at start, so
+# ${GATEWAY_SESSION} below is replaced by the value from ../.env. Every other
+# $variable is nginx's own and is left alone -- the entrypoint substitutes
+# only names that exist in the environment.
+
+map $cookie_session $session_ok {
+    default              0;
+    "${GATEWAY_SESSION}" 1;
+}
+
+map $http_accept $wants_html {
+    default      0;
+    "~*text/html" 1;
+}
+
+# What to do with an unauthenticated request: nothing, redirect, or reject.
+map "$session_ok:$wants_html" $unauth {
+    default "";
+    "0:1"   redirect;
+    "0:0"   reject;
+}
+
+# Open WebUI's socket.io transport upgrades to a websocket.
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ""      close;
+}
+
+server {
+    listen 80;
+    server_name _;
+    default_type application/json;
+    # Published as 127.0.0.1:3000 but listening on 80: an absolute Location
+    # would drop the port. Relative keeps whatever the browser used.
+    absolute_redirect off;
+
+    # Liveness for the compose healthcheck. No cookie needed: a gateway's own
+    # health is not a session question.
+    location = /gateway/health {
+        return 200 '{"status": "ok"}';
+    }
+
+    # The stand-in for "log in at the SSO": hands the browser the cookie and
+    # sends it to the UI. HttpOnly, as a real session cookie would be.
+    location = /gateway/login {
+        add_header Set-Cookie "session=${GATEWAY_SESSION}; Path=/; HttpOnly; SameSite=Lax";
+        return 302 /;
+    }
+
+    location = /gateway/logout {
+        add_header Set-Cookie "session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0";
+        return 200 '{"detail": "session cleared"}';
+    }
+
+    location / {
+        if ($unauth = redirect) {
+            return 302 /gateway/login;
+        }
+        if ($unauth = reject) {
+            return 401 '{"detail": "no session ID found"}';
+        }
+
+        proxy_pass http://webui:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Upgrade           $http_upgrade;
+        proxy_set_header Connection        $connection_upgrade;
+
+        # Token streams must reach the client as they are produced, and a long
+        # generation must not be cut off by the 60 s default.
+        proxy_buffering    off;
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+
+        # Document and model uploads through the UI.
+        client_max_body_size 200m;
+    }
+}
