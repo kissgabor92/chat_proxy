@@ -150,6 +150,7 @@ To test what happens without the cookie, do not delete the `.env` line — send 
 ## Troubleshooting
 
 - **Everything on 3000 answers `no session ID found`** — correct for a non-browser without the cookie. A browser is redirected to `/gateway/login` instead; if yours gets the JSON, it is not sending `Accept: text/html`. Proxy: `UPSTREAM_COOKIE` in `proxy_stack/.env` must equal `session=` + `GATEWAY_SESSION` from `llm_stack/.env`, and the proxy container must be recreated after editing it.
+- **An nginx `502 Bad Gateway` page, from the UI or relayed by the proxy** — the gateway could not reach Open WebUI. The template re-resolves `webui` via Docker's DNS on every request for exactly this: without that, recreating the webui container (a compose edit, `up -d` on a dependency) leaves nginx sending to the old address until it is restarted. If it still happens, `docker compose logs gateway` shows `connect() failed ... upstream: "http://<ip>:8080"` — compare that ip with `docker inspect chat-proxy-webui`.
 - **`/gateway/login` redirects to the wrong host** — `absolute_redirect off` is set for this; if it is missing, nginx builds the `Location` from its own port 80.
 - **UI lists no models** — check `docker compose exec ollama ollama list`, then `docker compose exec webui curl -s http://ollama:11434/api/tags`.
 - **Login screen won't accept anything / "can't turn off authentication"** — a `WEBUI_AUTH=False` was set after an account existed. Remove it, or wipe `chat-proxy-openwebui-data` and start over.

@@ -645,6 +645,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def send_detail(self, status, detail):
         """FastAPI's error shape, so clients written against Open WebUI parse it."""
+        if status >= 500:
+            # A client shows "Server error: 502" and little else; the reason
+            # has to be findable here.
+            log("%d: %s" % (status, detail))
         self.send_json(status, {"detail": detail})
 
     def relay_error(self, status, raw):
@@ -664,6 +668,11 @@ class Handler(BaseHTTPRequestHandler):
             log("upstream refused with %d and no cookie was sent -- if it sits "
                 "behind an SSO gateway, that gateway wants a session cookie: "
                 "set UPSTREAM_COOKIE" % status)
+        if status >= 500:
+            # An upstream 5xx is usually the gateway in front of Open WebUI
+            # failing to reach it (nginx's own "502 Bad Gateway" page), not
+            # Open WebUI itself. Say what came back, since the client will not.
+            log("upstream answered %d: %s" % (status, raw.decode(errors="replace")[:200].replace("\n", " ")))
         if isinstance(parsed, dict):
             return self.send_json(status, parsed)
         return self.send_detail(status, raw.decode(errors="replace")[:500])

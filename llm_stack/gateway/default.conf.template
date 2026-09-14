@@ -68,6 +68,15 @@ server {
         return 200 '{"detail": "session cleared"}';
     }
 
+    # Re-resolve `webui` through Docker's embedded DNS on every request. A
+    # plain proxy_pass hostname is resolved ONCE at startup; when the webui
+    # container is recreated and comes back on another address, nginx keeps
+    # connecting to the old one and answers every request with its own "502
+    # Bad Gateway" page until it is restarted. Measured on this host: that is
+    # precisely the 502 VS Code reported. A variable target forces a lookup.
+    resolver 127.0.0.11 valid=10s ipv6=off;
+    set $webui http://webui:8080;
+
     location / {
         if ($unauth = redirect) {
             return 302 /gateway/login;
@@ -76,7 +85,7 @@ server {
             return 401 '{"detail": "no session ID found"}';
         }
 
-        proxy_pass http://webui:8080;
+        proxy_pass $webui;
         proxy_http_version 1.1;
         proxy_set_header Host              $host;
         proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
